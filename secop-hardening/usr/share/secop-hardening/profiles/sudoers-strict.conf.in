@@ -1,0 +1,18 @@
+
+# --- Mode strict - ANSSI BP-028 R39 et R41 ---------------------------------
+#
+# ATTENTION - Ces deux directives changent le comportement de sudo :
+#
+#   noexec      empeche un programme lance par sudo d'en executer un autre.
+#               Sans la clause EXEC ci-dessous, "sudo bash script.sh" echoue
+#               sur chaque commande appelee par le script.
+#
+#   requiretty  interdit toute execution non interactive de sudo, ce qui
+#               casse cron, Ansible et les scripts d'automatisation.
+#
+# La clause EXEC restitue le droit d'execution au groupe administrateur,
+# conformement au referentiel. R41 recommande de restreindre cette clause
+# aux seules commandes qui en ont besoin plutot que de l'accorder a tout.
+
+Defaults noexec, requiretty
+%@GROUP@ ALL=(ALL:ALL) EXEC: ALL

@@ -1,0 +1,19 @@
+#!/bin/sh
+set -e
+
+case "$1" in
+    remove)
+        rm -f /etc/sysctl.d/99-secop-anssi.conf
+        rm -f /etc/modprobe.d/99-secop-anssi.conf
+        rm -f /etc/ssh/sshd_config.d/99-secop-anssi.conf
+        ;;
+    purge)
+        rm -f /etc/sysctl.d/99-secop-anssi.conf
+        rm -f /etc/modprobe.d/99-secop-anssi.conf
+        rm -f /etc/ssh/sshd_config.d/99-secop-anssi.conf
+        rm -rf /var/lib/secop-hardening
+        rm -rf /etc/secop
+        ;;
+esac
+
+exit 0

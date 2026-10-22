@@ -1,0 +1,19 @@
+Package: secop-hardening
+Version: 0.7.1
+Section: admin
+Priority: optional
+Architecture: all
+Maintainer: SECOP <secop@example.local>
+Depends: procps, kmod, coreutils
+Recommends: openssh-server
+Suggests: auditd, aide, rsyslog, nftables, libpam-pwquality, libcap2-bin, sudo
+Description: Durcissement ANSSI BP-028 pour Debian et Ubuntu
+ Applique un socle de durcissement systeme aligne sur le guide ANSSI BP-028
+ (recommandations R9 a R14, R58) au moyen de fichiers drop-in uniquement.
+ .
+ Le paquet ne remplace jamais un fichier appartenant a un autre paquet : il
+ depose ses reglages dans /etc/sysctl.d, /etc/modprobe.d et
+ /etc/ssh/sshd_config.d, ce qui garantit une desinstallation propre.
+ .
+ Un profil dedie au role Samba AD DC ajuste les parametres qui entrent en
+ conflit avec Kerberos, LDAP et la plage RPC dynamique.

@@ -1,0 +1,16 @@
+# --- ANSSI BP-028 R71 : export des journaux vers un serveur distant --------
+#
+# Un journal conserve uniquement en local peut etre efface par un attaquant
+# ayant obtenu les droits root. L'export vers un serveur tiers garantit la
+# conservation des traces.
+#
+# Protocole TCP avec file d'attente sur disque : les messages sont conserves
+# si le serveur distant devient injoignable, puis reemis a son retour.
+
+$ActionQueueFileName secop_fwd
+$ActionQueueMaxDiskSpace 256m
+$ActionQueueSaveOnShutdown on
+$ActionQueueType LinkedList
+$ActionResumeRetryCount -1
+
+*.* @@@HOST@:@PORT@

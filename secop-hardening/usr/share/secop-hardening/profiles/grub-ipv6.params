@@ -1,0 +1,2 @@
+# --- ANSSI BP-028 R13 : desactivation d'IPv6 au demarrage -----------------
+ipv6.disable=1

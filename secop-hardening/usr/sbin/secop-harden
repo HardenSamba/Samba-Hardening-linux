@@ -1,0 +1,1069 @@
+#!/bin/bash
+#
+# secop-harden - applique ou retire le durcissement ANSSI BP-028
+#
+# Deux categories de mesures :
+#   - depot de fichiers drop-in prefixes "99-secop-", supprimables tels quels ;
+#   - modifications d'attributs existants (permissions, capacites), dont
+#     l'etat initial est enregistre dans /var/lib/secop-hardening pour
+#     permettre une restauration fidele.
+
+set -u
+
+CONF="/etc/secop/hardening.conf"
+PROFILES="/usr/share/secop-hardening/profiles"
+STATE="/var/lib/secop-hardening"
+
+SYSCTL_OUT="/etc/sysctl.d/99-secop-anssi.conf"
+MODPROBE_OUT="/etc/modprobe.d/99-secop-anssi.conf"
+SSHD_OUT="/etc/ssh/sshd_config.d/99-secop-anssi.conf"
+SUDOERS_OUT="/etc/sudoers.d/99-secop-anssi"
+UMASK_OUT="/etc/profile.d/99-secop-umask.sh"
+TMOUT_OUT="/etc/profile.d/99-secop-tmout.sh"
+AUDIT_OUT="/etc/audit/rules.d/99-secop-anssi.rules"
+AIDE_OUT="/etc/aide/aide.conf.d/99-secop-anssi"
+RSYSLOG_OUT="/etc/rsyslog.d/99-secop-anssi.conf"
+AIDE_SERVICE="/etc/systemd/system/secop-aide-check.service"
+AIDE_TIMER="/etc/systemd/system/secop-aide-check.timer"
+GRUB_OUT="/etc/default/grub.d/99-secop-anssi.cfg"
+PWQ_OUT="/etc/security/pwquality.conf.d/99-secop-anssi.conf"
+FAILLOCK_OUT="/etc/security/faillock.conf"
+PAM_PWQ="/usr/share/pam-configs/secop-pwquality"
+PAM_FAILLOCK="/usr/share/pam-configs/secop-faillock"
+FAILLOCK_STATE="$STATE/faillock.state"
+FW_OUT="/etc/nftables.d/99-secop-anssi.nft"
+FW_SERVICE="/etc/systemd/system/secop-firewall.service"
+SUID_STATE="$STATE/suid.state"
+MODLOCK_SERVICE="/etc/systemd/system/secop-modules-lock.service"
+
+PERMS_STATE="$STATE/permissions.state"
+CAPS_STATE="$STATE/capabilities.state"
+SUDOBIN_STATE="$STATE/sudobin.state"
+
+RED=$'\033[0;31m'; GREEN=$'\033[0;32m'; YELLOW=$'\033[0;33m'; NC=$'\033[0m'
+
+log()  { printf '%s\n' "$*"; }
+ok()   { printf '%s[ OK ]%s %s\n' "$GREEN" "$NC" "$*"; }
+warn() { printf '%s[ !! ]%s %s\n' "$YELLOW" "$NC" "$*"; }
+err()  { printf '%s[ KO ]%s %s\n' "$RED" "$NC" "$*" >&2; }
+
+need_root() {
+    if [ "$(id -u)" -ne 0 ]; then
+        err "Ce script doit etre execute en root."
+        exit 1
+    fi
+}
+
+load_conf() {
+    SECOP_PROFILE="intermediaire"
+    SECOP_ROLE="generic"
+    SECOP_SYSCTL="yes"
+    SECOP_MODPROBE="yes"
+    SECOP_SSHD="no"
+    SECOP_PERMISSIONS="yes"
+    SECOP_SUDO="yes"
+    SECOP_UMASK="yes"
+    SECOP_TMOUT="yes"
+    SECOP_CAPABILITIES="no"
+    SECOP_DISABLE_IPV6="no"
+    SECOP_DISABLE_USB="yes"
+    SECOP_TMOUT_SECONDS="600"
+    SECOP_SUDO_GROUP="sudo"
+    SECOP_SUDO_STRICT="no"
+    SECOP_AUDITD="yes"
+    SECOP_AIDE="yes"
+    SECOP_RSYSLOG_REMOTE="no"
+    SECOP_RSYSLOG_HOST=""
+    SECOP_RSYSLOG_PORT="514"
+    SECOP_GRUB="no"
+    SECOP_GRUB_NOSMT="no"
+    SECOP_GRUB_IOMMU="no"
+    SECOP_PWQUALITY="no"
+    SECOP_FAILLOCK="no"
+    SECOP_FIREWALL="no"
+    SECOP_FIREWALL_SSH_PORT="22"
+    SECOP_FIREWALL_TCP=""
+    SECOP_FIREWALL_UDP=""
+    SECOP_SUID="no"
+    SECOP_MODULES_LOCK="no"
+
+    if [ -r "$CONF" ]; then
+        # shellcheck source=/dev/null
+        . "$CONF"
+    else
+        warn "$CONF introuvable : utilisation des valeurs par defaut."
+    fi
+
+    case "$SECOP_PROFILE" in
+        minimal|intermediaire) ;;
+        *) err "SECOP_PROFILE invalide : $SECOP_PROFILE"; exit 1 ;;
+    esac
+    case "$SECOP_ROLE" in
+        generic|samba-ad-dc) ;;
+        *) err "SECOP_ROLE invalide : $SECOP_ROLE"; exit 1 ;;
+    esac
+    if ! [ "$SECOP_TMOUT_SECONDS" -gt 0 ] 2>/dev/null; then
+        err "SECOP_TMOUT_SECONDS doit etre un entier positif."
+        exit 1
+    fi
+}
+
+header() {
+    printf '# Fichier genere par secop-harden - NE PAS EDITER A LA MAIN\n'
+    printf '# Modifier %s puis relancer : secop-harden apply\n' "$CONF"
+    printf '# Profil : %s | Role : %s | Genere le : %s\n\n' \
+           "$SECOP_PROFILE" "$SECOP_ROLE" "$(date '+%Y-%m-%d %H:%M:%S')"
+}
+
+# --------------------------------------------------------------- sysctl
+
+build_sysctl() {
+    [ "$SECOP_SYSCTL" = "yes" ] || { rm -f "$SYSCTL_OUT"; return 0; }
+
+    {
+        header
+        cat "$PROFILES/sysctl-minimal.conf"
+        echo
+        if [ "$SECOP_PROFILE" = "intermediaire" ]; then
+            cat "$PROFILES/sysctl-intermediaire.conf"
+            echo
+        fi
+        # Le profil de role est concatene en dernier : sysctl retient la
+        # derniere valeur lue, les surcharges de role priment donc.
+        cat "$PROFILES/sysctl-role-${SECOP_ROLE}.conf"
+        echo
+
+        if [ "$SECOP_DISABLE_IPV6" = "yes" ]; then
+            cat "$PROFILES/sysctl-ipv6-disable.conf"
+        elif [ "$SECOP_ROLE" = "samba-ad-dc" ]; then
+            printf '# IPv6 laisse actif : requis par defaut pour le role samba-ad-dc.\n'
+        else
+            printf '# IPv6 laisse actif (SECOP_DISABLE_IPV6=no).\n'
+        fi
+    } > "$SYSCTL_OUT"
+
+    chmod 0644 "$SYSCTL_OUT"
+    if [ "$SECOP_DISABLE_IPV6" = "yes" ] && [ "$SECOP_ROLE" = "samba-ad-dc" ]; then
+        warn "IPv6 desactive sur un role samba-ad-dc : verifier les enregistrements DNS AAAA."
+    fi
+    ok "sysctl genere : $SYSCTL_OUT"
+}
+
+build_modprobe() {
+    [ "$SECOP_MODPROBE" = "yes" ] || { rm -f "$MODPROBE_OUT"; return 0; }
+
+    {
+        header
+        cat "$PROFILES/modprobe-protocols.conf"
+        echo
+        if [ "$SECOP_DISABLE_USB" = "yes" ]; then
+            cat "$PROFILES/modprobe-usb.conf"
+        else
+            printf '# Stockage USB laisse actif (SECOP_DISABLE_USB=no).\n'
+        fi
+    } > "$MODPROBE_OUT"
+
+    chmod 0644 "$MODPROBE_OUT"
+    ok "modprobe genere : $MODPROBE_OUT"
+}
+
+# ----------------------------------------------------------- permissions
+
+build_permissions() {
+    if [ "$SECOP_PERMISSIONS" != "yes" ]; then
+        restore_permissions
+        return 0
+    fi
+
+    # Premiere application seulement : on fige l'etat initial une fois pour
+    # toutes, sinon une seconde execution enregistrerait l'etat deja durci.
+    local record=0
+    [ -f "$PERMS_STATE" ] || record=1
+
+    local n=0 path mode owner group img
+    while IFS='|' read -r path mode owner group; do
+        case "$path" in \#*|"") continue ;; esac
+        [ -e "$path" ] || continue
+
+        if [ "$record" -eq 1 ]; then
+            printf '%s|%s|%s|%s\n' \
+                "$path" "$(stat -c '%a' "$path")" \
+                "$(stat -c '%U' "$path")" "$(stat -c '%G' "$path")" >> "$PERMS_STATE"
+        fi
+
+        chown "${owner}:${group}" "$path" 2>/dev/null || true
+        chmod "$mode" "$path" 2>/dev/null || true
+        n=$((n + 1))
+    done < "$PROFILES/permissions.list"
+
+    # R6 : les images initramfs portent un nom dependant de la version.
+    for img in /boot/initrd.img-*; do
+        [ -e "$img" ] || continue
+        if [ "$record" -eq 1 ]; then
+            printf '%s|%s|%s|%s\n' "$img" "$(stat -c '%a' "$img")" \
+                "$(stat -c '%U' "$img")" "$(stat -c '%G' "$img")" >> "$PERMS_STATE"
+        fi
+        chown root:root "$img" 2>/dev/null || true
+        chmod 0400 "$img" 2>/dev/null || true
+        n=$((n + 1))
+    done
+
+    [ -f "$PERMS_STATE" ] && chmod 0600 "$PERMS_STATE"
+    ok "permissions appliquees sur $n element(s)."
+    warn "update-initramfs recree les images en 0644 : relancer 'secop-harden apply' apres une mise a jour du noyau."
+    return 0
+}
+
+restore_permissions() {
+    [ -f "$PERMS_STATE" ] || return 0
+    local path mode owner group n=0
+    while IFS='|' read -r path mode owner group; do
+        [ -e "$path" ] || continue
+        chown "${owner}:${group}" "$path" 2>/dev/null || true
+        chmod "$mode" "$path" 2>/dev/null || true
+        n=$((n + 1))
+    done < "$PERMS_STATE"
+    rm -f "$PERMS_STATE"
+    [ "$n" -gt 0 ] && ok "permissions d'origine restaurees sur $n element(s)."
+    return 0
+}
+
+# ------------------------------------------------------------------ sudo
+
+build_sudo() {
+    if [ "$SECOP_SUDO" != "yes" ]; then
+        if [ -f "$SUDOERS_OUT" ]; then rm -f "$SUDOERS_OUT"; ok "directives sudo retirees."; fi
+        restore_sudo_binary
+        return 0
+    fi
+
+    if [ ! -d /etc/sudoers.d ]; then
+        warn "/etc/sudoers.d absent (sudo non installe) : R39 et R40 ignores."
+        return 0
+    fi
+
+    local has_visudo=""
+    command -v visudo >/dev/null 2>&1 && has_visudo="yes"
+
+    local tmp probe line kept=0 skipped=0 skipped_names=""
+    tmp=$(mktemp) || return 1
+    probe=$(mktemp) || { rm -f "$tmp"; return 1; }
+    header > "$tmp"
+
+    # Chaque directive est testee seule : une implementation de sudo qui n'en
+    # comprend pas une (sudo-rs ignore "logfile", par exemple) ne doit pas
+    # faire echouer tout le fichier.
+    while IFS= read -r line; do
+        case "$line" in \#*|"") continue ;; esac
+        cp "$tmp" "$probe"
+        printf '%s\n' "$line" >> "$probe"
+        if [ -z "$has_visudo" ] || visudo -cf "$probe" >/dev/null 2>&1; then
+            printf '%s\n' "$line" >> "$tmp"
+            kept=$((kept + 1))
+        else
+            skipped=$((skipped + 1))
+            skipped_names="${skipped_names} $(printf '%s' "$line" | awk '{print $2}')"
+        fi
+    done < "$PROFILES/sudoers-hardening.conf"
+
+    if [ "$SECOP_SUDO_STRICT" = "yes" ]; then
+        sed "s/@GROUP@/${SECOP_SUDO_GROUP}/" "$PROFILES/sudoers-strict.conf.in" >> "$tmp"
+        if [ -n "$has_visudo" ] && ! visudo -cf "$tmp" >/dev/null 2>&1; then
+            err "le mode strict n'est pas supporte par cette implementation de sudo."
+            rm -f "$tmp" "$probe"
+            return 1
+        fi
+    fi
+    rm -f "$probe"
+
+    if [ "$kept" -eq 0 ]; then
+        err "aucune directive sudo retenue : fichier non installe."
+        rm -f "$tmp"
+        return 1
+    fi
+
+    if ! install -m 0440 -o root -g root "$tmp" "$SUDOERS_OUT"; then
+        err "impossible d'installer $SUDOERS_OUT."
+        rm -f "$tmp"
+        return 1
+    fi
+    rm -f "$tmp"
+    ok "directives sudo generees : $kept retenue(s) sur $((kept + skipped))."
+    if [ "$skipped" -gt 0 ]; then
+        warn "non supportee(s) par cette version de sudo :${skipped_names}"
+    fi
+    if [ "$SECOP_SUDO_STRICT" = "yes" ]; then
+        warn "mode strict actif : noexec et requiretty. Verifier cron, Ansible"
+        warn "et l'execution de scripts via sudo avant de passer en production."
+    fi
+
+    harden_sudo_binary
+}
+
+harden_sudo_binary() {
+    # R38 : /usr/bin/sudo doit etre en 4750 et reserve a un groupe dedie.
+    local bin="/usr/bin/sudo" members
+    [ -e "$bin" ] || return 0
+
+    if ! getent group "$SECOP_SUDO_GROUP" >/dev/null 2>&1; then
+        warn "groupe '$SECOP_SUDO_GROUP' inexistant : R38 ignore."
+        return 0
+    fi
+
+    # Garde-fou : si le groupe est vide, plus personne ne peut utiliser sudo
+    # apres l'operation.
+    members=$(getent group "$SECOP_SUDO_GROUP" | cut -d: -f4)
+    if [ -z "$members" ]; then
+        warn "groupe '$SECOP_SUDO_GROUP' vide : R38 ignore pour ne pas bloquer l'acces administrateur."
+        return 0
+    fi
+
+    if [ ! -f "$SUDOBIN_STATE" ]; then
+        printf '%s|%s|%s|%s\n' "$bin" "$(stat -c '%a' "$bin")" \
+            "$(stat -c '%U' "$bin")" "$(stat -c '%G' "$bin")" > "$SUDOBIN_STATE"
+    fi
+
+    chown "root:${SECOP_SUDO_GROUP}" "$bin" && chmod 4750 "$bin"
+    ok "sudo restreint au groupe '$SECOP_SUDO_GROUP' (membres : $members)."
+}
+
+restore_sudo_binary() {
+    [ -f "$SUDOBIN_STATE" ] || return 0
+    local path mode owner group
+    IFS='|' read -r path mode owner group < "$SUDOBIN_STATE"
+    if [ -e "$path" ]; then
+        chown "${owner}:${group}" "$path" 2>/dev/null || true
+        chmod "$mode" "$path" 2>/dev/null || true
+        ok "permissions d'origine restaurees sur $path."
+    fi
+    rm -f "$SUDOBIN_STATE"
+    return 0
+}
+
+# ------------------------------------------------------------- profile.d
+
+build_profile_files() {
+    if [ "$SECOP_UMASK" = "yes" ]; then
+        { header; cat "$PROFILES/profile-umask.sh"; } > "$UMASK_OUT"
+        chmod 0644 "$UMASK_OUT"
+        ok "umask genere : $UMASK_OUT"
+    else
+        rm -f "$UMASK_OUT"
+    fi
+
+    if [ "$SECOP_TMOUT" = "yes" ]; then
+        {
+            header
+            sed "s/@TMOUT@/${SECOP_TMOUT_SECONDS}/" "$PROFILES/profile-tmout.sh.in"
+        } > "$TMOUT_OUT"
+        chmod 0644 "$TMOUT_OUT"
+        ok "expiration de session generee : ${SECOP_TMOUT_SECONDS}s"
+    else
+        rm -f "$TMOUT_OUT"
+    fi
+}
+
+# ---------------------------------------------------------- capabilities
+
+build_capabilities() {
+    if [ "$SECOP_CAPABILITIES" != "yes" ]; then
+        restore_capabilities
+        return 0
+    fi
+    if ! command -v setcap >/dev/null 2>&1; then
+        warn "setcap absent (paquet libcap2-bin) : R63 ignore."
+        return 0
+    fi
+
+    local record=0
+    [ -f "$CAPS_STATE" ] || record=1
+
+    local line f caps n=0
+    while IFS= read -r line; do
+        [ -n "$line" ] || continue
+        f=${line%% *}
+        caps=${line#* }
+        [ -e "$f" ] || continue
+        if [ "$record" -eq 1 ]; then
+            printf '%s|%s\n' "$f" "$caps" >> "$CAPS_STATE"
+        fi
+        if setcap -r "$f" 2>/dev/null; then n=$((n + 1)); fi
+    done < <(find /usr /bin /sbin -type f -perm /111 -exec getcap {} \; 2>/dev/null)
+
+    ok "capacites retirees sur $n binaire(s)."
+    if [ "$n" -gt 0 ]; then
+        warn "verifier que les services concernes fonctionnent toujours."
+    fi
+    return 0
+}
+
+restore_capabilities() {
+    [ -f "$CAPS_STATE" ] || return 0
+    command -v setcap >/dev/null 2>&1 || return 0
+    local f caps n=0
+    while IFS='|' read -r f caps; do
+        [ -e "$f" ] || continue
+        if setcap "$caps" "$f" 2>/dev/null; then n=$((n + 1)); fi
+    done < "$CAPS_STATE"
+    rm -f "$CAPS_STATE"
+    [ "$n" -gt 0 ] && ok "capacites d'origine restaurees sur $n binaire(s)."
+    return 0
+}
+
+# ------------------------------------------------------------------- suid
+
+build_suid() {
+    if [ "$SECOP_SUID" != "yes" ]; then
+        restore_suid
+        return 0
+    fi
+
+    local record=0
+    [ -f "$SUID_STATE" ] || record=1
+
+    local f n=0
+    while IFS= read -r f; do
+        [ -n "$f" ] || continue
+        # La liste d'exceptions est comparee ligne a ligne, en exact.
+        if grep -qxF "$f" "$PROFILES/suid-exceptions.list" 2>/dev/null; then
+            continue
+        fi
+        [ "$record" -eq 1 ] && printf '%s|%s\n' "$f" "$(stat -c '%a' "$f")" >> "$SUID_STATE"
+        chmod u-s,g-s "$f" 2>/dev/null && n=$((n + 1))
+    done < <(find / -type d \( -path /proc -o -path /sys -o -path /dev -o -path /run \) -prune -o \
+             -type f \( -perm -4000 -uid 0 -o -perm -2000 -gid 0 \) -print 2>/dev/null)
+
+    [ -f "$SUID_STATE" ] && chmod 0600 "$SUID_STATE"
+    ok "droits speciaux retires sur $n binaire(s)."
+    if [ "$n" -gt 0 ]; then
+        warn "Sur un poste graphique, pkexec et Xorg.wrap en font partie :"
+        warn "l'elevation de privileges graphique et X peuvent cesser de fonctionner."
+    fi
+    return 0
+}
+
+restore_suid() {
+    [ -f "$SUID_STATE" ] || return 0
+    local f mode n=0
+    while IFS='|' read -r f mode; do
+        [ -e "$f" ] || continue
+        chmod "$mode" "$f" 2>/dev/null && n=$((n + 1))
+    done < "$SUID_STATE"
+    rm -f "$SUID_STATE"
+    [ "$n" -gt 0 ] && ok "droits speciaux d'origine restaures sur $n binaire(s)."
+    return 0
+}
+
+# -------------------------------------------------- verrouillage modules
+
+build_modules_lock() {
+    if [ "$SECOP_MODULES_LOCK" != "yes" ]; then
+        remove_modules_lock
+        return 0
+    fi
+
+    install -m 0644 "$PROFILES/modules-lock.service" "$MODLOCK_SERVICE"
+    systemctl daemon-reload >/dev/null 2>&1
+    systemctl enable secop-modules-lock.service >/dev/null 2>&1
+    ok "verrouillage des modules arme pour le prochain demarrage."
+    warn "Il n'est PAS applique maintenant : le verrou est irreversible a chaud"
+    warn "et empecherait tout chargement de module jusqu'au redemarrage suivant."
+    return 0
+}
+
+remove_modules_lock() {
+    [ -f "$MODLOCK_SERVICE" ] || return 0
+    systemctl disable secop-modules-lock.service >/dev/null 2>&1
+    rm -f "$MODLOCK_SERVICE"
+    systemctl daemon-reload >/dev/null 2>&1
+    ok "verrouillage des modules retire."
+    return 0
+}
+
+# --------------------------------------------------------------- pare-feu
+
+generate_firewall_ruleset() {
+    # Ecrit le jeu de regles sur la sortie standard.
+    cat "$PROFILES/firewall-header.nft"
+
+    # Le port d'administration est toujours ouvert, quoi qu'il arrive.
+    printf '\n        # Administration : port ouvert en toutes circonstances.\n'
+    printf '        tcp dport %s accept\n' "$SECOP_FIREWALL_SSH_PORT"
+
+    [ "$SECOP_ROLE" = "samba-ad-dc" ] && cat "$PROFILES/firewall-samba.nft"
+
+    if [ -n "$SECOP_FIREWALL_TCP" ]; then
+        printf '\n        # Ports TCP supplementaires declares localement.\n'
+        printf '        tcp dport { %s } accept\n' "$SECOP_FIREWALL_TCP"
+    fi
+    if [ -n "$SECOP_FIREWALL_UDP" ]; then
+        printf '        udp dport { %s } accept\n' "$SECOP_FIREWALL_UDP"
+    fi
+
+    cat "$PROFILES/firewall-footer.nft"
+}
+
+build_firewall() {
+    if [ "$SECOP_FIREWALL" != "yes" ]; then
+        remove_firewall
+        return 0
+    fi
+    if ! command -v nft >/dev/null 2>&1; then
+        warn "nft absent : R79 ignore. Installer avec : apt install nftables"
+        return 0
+    fi
+
+    mkdir -p /etc/nftables.d
+    generate_firewall_ruleset > "$FW_OUT"
+    chmod 0600 "$FW_OUT"
+
+    # Validation syntaxique avant tout chargement.
+    if ! nft -c -f "$FW_OUT" >/dev/null 2>&1; then
+        err "jeu de regles invalide : fichier retire."
+        rm -f "$FW_OUT"
+        return 1
+    fi
+
+    install -m 0644 "$PROFILES/firewall.service" "$FW_SERVICE"
+    systemctl daemon-reload >/dev/null 2>&1
+    if ! systemctl enable --now secop-firewall.service >/dev/null 2>&1; then
+        err "le service pare-feu n'a pas demarre : regles non appliquees."
+        return 1
+    fi
+
+    ok "pare-feu actif (role ${SECOP_ROLE}, administration sur le port ${SECOP_FIREWALL_SSH_PORT})."
+    warn "Verifier immediatement l'acces depuis une AUTRE machine."
+    warn "En cas de coupure, depuis la console : secop-harden firewall-off"
+    return 0
+}
+
+remove_firewall() {
+    local changed=0
+    if [ -f "$FW_SERVICE" ]; then
+        systemctl disable --now secop-firewall.service >/dev/null 2>&1
+        rm -f "$FW_SERVICE"
+        systemctl daemon-reload >/dev/null 2>&1
+        changed=1
+    fi
+    [ -f "$FW_OUT" ] && { rm -f "$FW_OUT"; changed=1; }
+    [ "$changed" -eq 1 ] && ok "pare-feu retire."
+    return 0
+}
+
+cmd_firewall_off() {
+    need_root
+    command -v nft >/dev/null 2>&1 && nft flush ruleset
+    systemctl stop secop-firewall.service >/dev/null 2>&1
+    ok "regles videes, tout le trafic est de nouveau autorise."
+    warn "Le pare-feu se rechargera au prochain demarrage. Pour le desactiver"
+    warn "durablement, passer SECOP_FIREWALL a \"no\" puis : secop-harden apply"
+}
+
+cmd_firewall_test() {
+    need_root
+    load_conf
+    command -v nft >/dev/null 2>&1 || { err "nft n'est pas installe."; exit 1; }
+
+    local tmp
+    tmp=$(mktemp) || exit 1
+    SECOP_FIREWALL="yes"
+    generate_firewall_ruleset > "$tmp"
+    if ! nft -c -f "$tmp" >/dev/null 2>&1; then
+        err "jeu de regles invalide."
+        rm -f "$tmp"
+        exit 1
+    fi
+
+    log "Application temporaire du pare-feu pendant 60 secondes."
+    log "Tester la connexion depuis une autre machine des maintenant."
+    log "Les regles seront retirees automatiquement, meme si cette session est coupee."
+    log ""
+
+    # Le retrait est lance en tache de fond et survit a la perte de session :
+    # c'est ce qui garantit qu'une regle fautive ne bloque pas la machine.
+    nohup sh -c "sleep 60; nft flush ruleset" >/dev/null 2>&1 &
+    nft -f "$tmp"
+    rm -f "$tmp"
+
+    sleep 62
+    ok "regles retirees. Si la connexion a tenu, activer SECOP_FIREWALL=\"yes\"."
+}
+
+# -------------------------------------------------------------------- pam
+
+build_pwquality() {
+    if [ "$SECOP_PWQUALITY" != "yes" ]; then
+        remove_pwquality
+        return 0
+    fi
+    if ! ls /usr/lib/*/security/pam_pwquality.so >/dev/null 2>&1; then
+        warn "pam_pwquality absent : R31 ignore. Installer avec : apt install libpam-pwquality"
+        return 0
+    fi
+
+    mkdir -p /etc/security/pwquality.conf.d
+    { header; cat "$PROFILES/pwquality-secop.conf"; } > "$PWQ_OUT"
+    chmod 0644 "$PWQ_OUT"
+
+    install -m 0644 "$PROFILES/pam/secop-pwquality" "$PAM_PWQ"
+    if command -v pam-auth-update >/dev/null 2>&1; then
+        if ! pam-auth-update --package >/dev/null 2>&1; then
+            err "pam-auth-update a echoue : profil retire."
+            rm -f "$PAM_PWQ"
+            pam-auth-update --package >/dev/null 2>&1
+            return 1
+        fi
+    fi
+    ok "qualite des mots de passe activee (comptes locaux uniquement)."
+    return 0
+}
+
+remove_pwquality() {
+    local changed=0
+    [ -f "$PWQ_OUT" ] && { rm -f "$PWQ_OUT"; changed=1; }
+    if [ -f "$PAM_PWQ" ]; then
+        rm -f "$PAM_PWQ"
+        command -v pam-auth-update >/dev/null 2>&1 && pam-auth-update --package >/dev/null 2>&1
+        changed=1
+    fi
+    [ "$changed" -eq 1 ] && ok "qualite des mots de passe retiree."
+    return 0
+}
+
+build_faillock() {
+    if [ "$SECOP_FAILLOCK" != "yes" ]; then
+        remove_faillock
+        return 0
+    fi
+    if ! ls /usr/lib/*/security/pam_faillock.so >/dev/null 2>&1; then
+        warn "pam_faillock absent : mesure ignoree."
+        return 0
+    fi
+
+    # faillock.conf appartient a libpam-runtime : on sauvegarde l'original.
+    if [ -f "$FAILLOCK_OUT" ] && [ ! -f "$FAILLOCK_STATE" ]; then
+        cp -a "$FAILLOCK_OUT" "$FAILLOCK_STATE"
+    fi
+    { header; cat "$PROFILES/faillock-secop.conf"; } > "$FAILLOCK_OUT"
+    chmod 0644 "$FAILLOCK_OUT"
+
+    install -m 0644 "$PROFILES/pam/secop-faillock" "$PAM_FAILLOCK"
+    if command -v pam-auth-update >/dev/null 2>&1; then
+        if ! pam-auth-update --package >/dev/null 2>&1; then
+            err "pam-auth-update a echoue : profil retire."
+            rm -f "$PAM_FAILLOCK"
+            pam-auth-update --package >/dev/null 2>&1
+            return 1
+        fi
+    fi
+    ok "blocage apres 5 echecs active, levee automatique apres 15 minutes."
+    warn "GARDER UNE SESSION ROOT OUVERTE et tester une connexion dans un autre"
+    warn "terminal avant de fermer celle-ci. Deblocage : faillock --reset --user NOM"
+    return 0
+}
+
+remove_faillock() {
+    local changed=0
+    if [ -f "$PAM_FAILLOCK" ]; then
+        rm -f "$PAM_FAILLOCK"
+        command -v pam-auth-update >/dev/null 2>&1 && pam-auth-update --package >/dev/null 2>&1
+        changed=1
+    fi
+    if [ -f "$FAILLOCK_STATE" ]; then
+        cp -a "$FAILLOCK_STATE" "$FAILLOCK_OUT"
+        rm -f "$FAILLOCK_STATE"
+        changed=1
+    fi
+    if [ "$changed" -eq 1 ]; then
+        command -v faillock >/dev/null 2>&1 && faillock --reset >/dev/null 2>&1
+        ok "blocage apres echecs retire et compteurs remis a zero."
+    fi
+    return 0
+}
+
+# ------------------------------------------------------------------- grub
+
+collect_grub_params() {
+    # Extrait les parametres d'un fragment, en ignorant commentaires et vides.
+    local file="$1" line
+    while IFS= read -r line; do
+        case "$line" in \#*|"") continue ;; esac
+        printf '%s ' "$line"
+    done < "$file"
+}
+
+build_grub() {
+    if [ "$SECOP_GRUB" != "yes" ]; then
+        remove_grub
+        return 0
+    fi
+    if [ ! -d /etc/default/grub.d ]; then
+        warn "/etc/default/grub.d absent : R7, R8 et R11 ignores."
+        return 0
+    fi
+    if ! command -v update-grub >/dev/null 2>&1; then
+        warn "update-grub absent : R7, R8 et R11 ignores."
+        return 0
+    fi
+
+    local params=""
+    params+=$(collect_grub_params "$PROFILES/grub-base.params")
+    [ "$SECOP_GRUB_NOSMT" = "yes" ] && params+=$(collect_grub_params "$PROFILES/grub-nosmt.params")
+    [ "$SECOP_GRUB_IOMMU" = "yes" ] && params+=$(collect_grub_params "$PROFILES/grub-iommu.params")
+    [ "$SECOP_DISABLE_IPV6" = "yes" ] && params+=$(collect_grub_params "$PROFILES/grub-ipv6.params")
+
+    {
+        header
+        printf '# Les parametres sont ajoutes a ceux deja presents, jamais substitues.\n'
+        printf 'GRUB_CMDLINE_LINUX_DEFAULT="$GRUB_CMDLINE_LINUX_DEFAULT %s"\n' "${params% }"
+    } > "$GRUB_OUT"
+    chmod 0644 "$GRUB_OUT"
+
+    if ! update-grub >/dev/null 2>&1; then
+        err "update-grub a echoue : le fragment est retire."
+        rm -f "$GRUB_OUT"
+        update-grub >/dev/null 2>&1
+        return 1
+    fi
+
+    ok "parametres de demarrage generes : $GRUB_OUT"
+    [ "$SECOP_GRUB_NOSMT" = "yes" ] && warn "mds=full,nosmt actif : le nombre de processeurs logiques sera divise par deux."
+    [ "$SECOP_GRUB_IOMMU" = "yes" ] && warn "iommu=force actif : verifier le demarrage avec un acces console ouvert."
+    warn "Ces parametres ne prennent effet qu'au prochain demarrage."
+    warn "En cas de blocage : au menu GRUB, touche 'e' pour editer la ligne linux."
+    return 0
+}
+
+remove_grub() {
+    [ -f "$GRUB_OUT" ] || return 0
+    rm -f "$GRUB_OUT"
+    command -v update-grub >/dev/null 2>&1 && update-grub >/dev/null 2>&1
+    ok "parametres de demarrage retires."
+    return 0
+}
+
+# ---------------------------------------------------------------- auditd
+
+build_auditd() {
+    if [ "$SECOP_AUDITD" != "yes" ]; then
+        if [ -f "$AUDIT_OUT" ]; then
+            rm -f "$AUDIT_OUT"
+            command -v augenrules >/dev/null 2>&1 && augenrules --load >/dev/null 2>&1
+            ok "regles auditd retirees."
+        fi
+        return 0
+    fi
+    if [ ! -d /etc/audit/rules.d ]; then
+        warn "auditd non installe : R73 ignore. Installer avec : apt install auditd"
+        return 0
+    fi
+
+    { header; cat "$PROFILES/audit-rules.conf"; } > "$AUDIT_OUT"
+    chmod 0640 "$AUDIT_OUT"
+    ok "regles auditd generees : $AUDIT_OUT"
+
+    # augenrules assemble les fichiers de rules.d puis auditctl les charge.
+    if command -v augenrules >/dev/null 2>&1; then
+        if augenrules --load >/dev/null 2>&1; then
+            ok "regles auditd chargees ($(auditctl -l 2>/dev/null | wc -l) actives)."
+        else
+            warn "chargement des regles auditd en echec : verifier 'augenrules --check'."
+        fi
+    fi
+    if ! systemctl is-active --quiet auditd 2>/dev/null; then
+        warn "le service auditd n'est pas demarre : systemctl enable --now auditd"
+    fi
+    return 0
+}
+
+# ------------------------------------------------------------------ aide
+
+build_aide() {
+    if [ "$SECOP_AIDE" != "yes" ]; then
+        remove_aide
+        return 0
+    fi
+    if ! command -v aide >/dev/null 2>&1; then
+        warn "aide non installe : R76 et R77 ignores. Installer avec : apt install aide"
+        return 0
+    fi
+
+    if [ -d /etc/aide/aide.conf.d ]; then
+        { header; cat "$PROFILES/aide-secop.conf"; } > "$AIDE_OUT"
+        chmod 0644 "$AIDE_OUT"
+        ok "exclusions AIDE generees : $AIDE_OUT"
+    else
+        warn "/etc/aide/aide.conf.d absent : exclusions AIDE non deposees."
+    fi
+
+    # Verification periodique : un scellement jamais verifie ne sert a rien.
+    install -m 0644 "$PROFILES/aide-check.service" "$AIDE_SERVICE"
+    install -m 0644 "$PROFILES/aide-check.timer" "$AIDE_TIMER"
+    systemctl daemon-reload >/dev/null 2>&1
+    systemctl enable --now secop-aide-check.timer >/dev/null 2>&1 &&         ok "verification AIDE quotidienne activee."
+
+    if [ ! -f /var/lib/aide/aide.db ]; then
+        warn "aucune base de reference AIDE. Lancer : secop-harden aide-init"
+        warn "(operation longue : compter 5 a 15 minutes)."
+    fi
+    return 0
+}
+
+remove_aide() {
+    local changed=0
+    if [ -f "$AIDE_TIMER" ]; then
+        systemctl disable --now secop-aide-check.timer >/dev/null 2>&1
+        rm -f "$AIDE_TIMER" "$AIDE_SERVICE"
+        changed=1
+    fi
+    [ -f "$AIDE_OUT" ] && { rm -f "$AIDE_OUT"; changed=1; }
+    if [ "$changed" -eq 1 ]; then
+        systemctl daemon-reload >/dev/null 2>&1
+        ok "configuration AIDE retiree."
+    fi
+    # La base de scellement n'est jamais supprimee : elle peut servir de
+    # preuve apres un incident.
+    return 0
+}
+
+cmd_aide_init() {
+    need_root
+    command -v aide >/dev/null 2>&1 || { err "aide n'est pas installe."; exit 1; }
+
+    log "Construction de la base de reference AIDE."
+    log "Operation longue : ne pas interrompre."
+    log ""
+    if command -v aideinit >/dev/null 2>&1; then
+        aideinit -y -f
+    else
+        aide --init --config /etc/aide/aide.conf &&             mv -f /var/lib/aide/aide.db.new /var/lib/aide/aide.db
+    fi
+
+    if [ -f /var/lib/aide/aide.db ]; then
+        chmod 0600 /var/lib/aide/aide.db
+        ok "base de reference creee : /var/lib/aide/aide.db"
+        warn "Conserver une copie hors de la machine : une base modifiable par"
+        warn "un attaquant ne prouve plus rien (ANSSI R77)."
+    else
+        err "la base de reference n'a pas ete creee."
+        exit 1
+    fi
+}
+
+# --------------------------------------------------------------- rsyslog
+
+build_rsyslog() {
+    if [ "$SECOP_RSYSLOG_REMOTE" != "yes" ]; then
+        [ -f "$RSYSLOG_OUT" ] && { rm -f "$RSYSLOG_OUT"; ok "export rsyslog retire."; }
+        return 0
+    fi
+    if [ ! -d /etc/rsyslog.d ]; then
+        warn "rsyslog non installe : R71 ignore. Installer avec : apt install rsyslog"
+        return 0
+    fi
+    if [ -z "$SECOP_RSYSLOG_HOST" ]; then
+        err "SECOP_RSYSLOG_HOST doit etre renseigne pour activer l'export."
+        return 1
+    fi
+
+    { header
+      sed -e "s/@HOST@/${SECOP_RSYSLOG_HOST}/" -e "s/@PORT@/${SECOP_RSYSLOG_PORT}/" \
+          "$PROFILES/rsyslog-remote.conf.in"
+    } > "$RSYSLOG_OUT"
+    chmod 0644 "$RSYSLOG_OUT"
+
+    if command -v rsyslogd >/dev/null 2>&1 && ! rsyslogd -N1 >/dev/null 2>&1; then
+        err "configuration rsyslog invalide : fichier retire."
+        rm -f "$RSYSLOG_OUT"
+        return 1
+    fi
+    systemctl restart rsyslog >/dev/null 2>&1
+    ok "export rsyslog vers ${SECOP_RSYSLOG_HOST}:${SECOP_RSYSLOG_PORT} active."
+    return 0
+}
+
+# -------------------------------------------------------------------- ssh
+
+build_sshd() {
+    if [ "$SECOP_SSHD" != "yes" ]; then
+        if [ -f "$SSHD_OUT" ]; then rm -f "$SSHD_OUT"; ok "durcissement SSH retire."; fi
+        return 0
+    fi
+    if [ ! -d /etc/ssh/sshd_config.d ]; then
+        warn "/etc/ssh/sshd_config.d absent : durcissement SSH ignore."
+        return 0
+    fi
+
+    { header; cat "$PROFILES/sshd-hardening.conf"; } > "$SSHD_OUT"
+    chmod 0600 "$SSHD_OUT"
+
+    # Validation avant rechargement : une erreur ici coupe l'acces distant.
+    if command -v sshd >/dev/null 2>&1; then
+        if ! sshd -t 2>/dev/null; then
+            err "Configuration SSH invalide : le fichier est retire."
+            rm -f "$SSHD_OUT"
+            return 1
+        fi
+    fi
+    ok "SSH genere : $SSHD_OUT"
+}
+
+# ---------------------------------------------------------------- actions
+
+reload_all() {
+    if command -v sysctl >/dev/null 2>&1 && [ -f "$SYSCTL_OUT" ]; then
+        sysctl -e -q --system >/dev/null 2>&1 && ok "parametres noyau recharges."
+    fi
+    if [ "$SECOP_SSHD" = "yes" ] && [ -f "$SSHD_OUT" ]; then
+        if systemctl is-active --quiet ssh 2>/dev/null; then
+            systemctl reload ssh && ok "service SSH recharge."
+        elif systemctl is-active --quiet sshd 2>/dev/null; then
+            systemctl reload sshd && ok "service SSH recharge."
+        fi
+    fi
+}
+
+cmd_apply() {
+    need_root
+    load_conf
+    mkdir -p "$STATE"; chmod 0700 "$STATE"
+
+    log "Application du durcissement SECOP (profil ${SECOP_PROFILE}, role ${SECOP_ROLE})"
+    log ""
+
+    build_sysctl
+    build_modprobe
+    build_permissions
+    build_sudo
+    build_profile_files
+    build_capabilities
+    build_grub
+    build_suid
+    build_modules_lock
+    build_firewall
+    build_pwquality
+    build_faillock
+    build_auditd
+    build_aide
+    build_rsyslog
+    build_sshd
+
+    date '+%Y-%m-%d %H:%M:%S' > "$STATE/last-apply"
+    log ""
+    reload_all
+    log ""
+    warn "Le blocage des modules noyau et l'expiration de session ne prennent"
+    warn "effet qu'apres redemarrage ou ouverture d'une nouvelle session."
+}
+
+cmd_revert() {
+    need_root
+    log "Retrait du durcissement SECOP"
+    log ""
+
+    local f
+    for f in "$SYSCTL_OUT" "$MODPROBE_OUT" "$SSHD_OUT" "$SUDOERS_OUT" \
+             "$UMASK_OUT" "$TMOUT_OUT"; do
+        if [ -f "$f" ]; then rm -f "$f"; ok "supprime : $f"; fi
+    done
+
+    for f in "$AUDIT_OUT" "$RSYSLOG_OUT"; do
+        [ -f "$f" ] && { rm -f "$f"; ok "supprime : $f"; }
+    done
+    command -v augenrules >/dev/null 2>&1 && augenrules --load >/dev/null 2>&1
+    remove_grub
+    remove_firewall
+    remove_pwquality
+    remove_faillock
+    remove_aide
+    systemctl restart rsyslog >/dev/null 2>&1
+
+    remove_modules_lock
+    restore_permissions
+    restore_sudo_binary
+    restore_suid
+    restore_capabilities
+
+    rm -f "$STATE/last-apply"
+    sysctl -e -q --system >/dev/null 2>&1
+    log ""
+    warn "Les parametres noyau deja appliques ne sont pas annules a chaud."
+    warn "Redemarrer pour revenir integralement a l'etat initial."
+}
+
+cmd_status() {
+    load_conf
+    log "Configuration : profil=${SECOP_PROFILE} role=${SECOP_ROLE}"
+    if [ -f "$STATE/last-apply" ]; then
+        log "Derniere application : $(cat "$STATE/last-apply")"
+    else
+        log "Derniere application : jamais"
+    fi
+    log ""
+    local f
+    for f in "$SYSCTL_OUT" "$MODPROBE_OUT" "$SUDOERS_OUT" "$UMASK_OUT" \
+             "$TMOUT_OUT" "$GRUB_OUT" "$PWQ_OUT" "$FW_OUT" "$AUDIT_OUT" "$AIDE_OUT" "$RSYSLOG_OUT" "$SSHD_OUT"; do
+        if [ -f "$f" ]; then ok "present : $f"; else log "       absent  : $f"; fi
+    done
+    log ""
+    [ -f "$PERMS_STATE" ]   && ok "permissions durcies ($(wc -l < "$PERMS_STATE") element(s) sauvegarde(s))."
+    [ -f "$SUDOBIN_STATE" ] && ok "binaire sudo restreint."
+    [ -f "$SUID_STATE" ]    && ok "droits speciaux retires ($(wc -l < "$SUID_STATE") binaire(s) sauvegarde(s))."
+    [ -f "$MODLOCK_SERVICE" ] && ok "verrouillage des modules arme."
+    [ -f "$CAPS_STATE" ]    && ok "capacites retirees ($(wc -l < "$CAPS_STATE") binaire(s) sauvegarde(s))."
+    return 0
+}
+
+cmd_diff() {
+    need_root
+    load_conf
+    if [ ! -f "$SYSCTL_OUT" ]; then
+        warn "Aucun fichier sysctl genere. Lancer : secop-harden apply"
+        return 0
+    fi
+
+    log "Ecarts entre la configuration cible et l'etat courant du noyau :"
+    log ""
+    local line key want have
+    while IFS= read -r line; do
+        case "$line" in \#*|"") continue ;; esac
+        key=${line%%=*}; key=${key// /}
+        want=${line#*=}; want=${want# }; want=${want% }
+        have=$(sysctl -n "$key" 2>/dev/null) || { warn "$key : cle inconnue de ce noyau"; continue; }
+        if [ "$(echo "$have" | tr -s '[:space:]' ' ')" != "$(echo "$want" | tr -s '[:space:]' ' ')" ]; then
+            err "$key : attendu [$want] / courant [$have]"
+        fi
+    done < "$SYSCTL_OUT"
+    ok "Comparaison terminee."
+}
+
+usage() {
+    cat <<'USAGE'
+Usage : secop-harden <commande>
+
+  apply     Genere et applique les mesures de durcissement
+  aide-init Construit la base de reference AIDE (operation longue)
+
+  firewall-test  Applique le pare-feu 60 secondes puis le retire, pour
+                 verifier sans risque que l'acces distant survit
+  firewall-off   Vide les regles immediatement (secours depuis la console)
+  revert    Retire les mesures et restaure l'etat initial sauvegarde
+  status    Affiche la configuration et les mesures en place
+  diff      Compare les parametres noyau cibles a l'etat courant
+  help      Affiche cette aide
+
+Configuration : /etc/secop/hardening.conf
+USAGE
+}
+
+case "${1:-help}" in
+    apply)     cmd_apply ;;
+    aide-init)     cmd_aide_init ;;
+    firewall-test) cmd_firewall_test ;;
+    firewall-off)  cmd_firewall_off ;;
+    revert) cmd_revert ;;
+    status) cmd_status ;;
+    diff)   cmd_diff ;;
+    help|-h|--help) usage ;;
+    *) err "Commande inconnue : $1"; usage; exit 1 ;;
+esac

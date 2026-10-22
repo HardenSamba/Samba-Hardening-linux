@@ -1,0 +1,17 @@
+#!/bin/sh
+set -e
+
+case "$1" in
+    remove|deconfigure)
+        # Les fichiers generes ne sont pas suivis par dpkg : on les retire
+        # explicitement avant le depaquetage.
+        if [ -x /usr/sbin/secop-harden ]; then
+            /usr/sbin/secop-harden revert || true
+        fi
+        ;;
+    upgrade|failed-upgrade)
+        # Rien a faire : postinst regenerera les fichiers.
+        ;;
+esac
+
+exit 0

@@ -1,0 +1,5 @@
+# --- ANSSI BP-028 R32 : expiration des sessions inactives ------------------
+# Deconnexion automatique apres @TMOUT@ secondes d'inactivite.
+TMOUT=@TMOUT@
+readonly TMOUT
+export TMOUT

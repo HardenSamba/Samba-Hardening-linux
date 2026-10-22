@@ -1,0 +1,67 @@
+#!/usr/sbin/nft -f
+#
+# Matrice de flux pour un controleur de domaine Samba Active Directory,
+# alignee sur le smb.conf de reference du document "Deploiement Samba AD".
+#
+# FICHIER DE REFERENCE - NON APPLIQUE PAR LE PAQUET.
+# Le jeu de regles nftables du referentiel SECOP n'ouvre que SSH en entree :
+# applique tel quel sur un DC, il coupe l'integralite des services AD.
+#
+# Adapter le nom de l'interface avant tout usage.
+
+table inet filter {
+    chain input {
+        type filter hook input priority 0; policy drop;
+
+        iif "lo" accept
+        ct state established,related accept
+        ct state invalid drop
+        ip protocol icmp icmp type { echo-request, echo-reply, destination-unreachable, time-exceeded } accept
+
+        # Administration
+        tcp dport 22 accept            # SSH
+        # tcp dport 3389 accept        # RDP (GNOME Remote Desktop), si utilise
+
+        # --- Active Directory : flux entrants indispensables ---
+        tcp dport 53 accept            # DNS
+        udp dport 53 accept            # DNS
+        tcp dport 88 accept            # Kerberos
+        udp dport 88 accept            # Kerberos
+        udp dport 123 accept           # NTP signe, requis par les clients AD
+        tcp dport 135 accept           # RPC Endpoint Mapper
+        tcp dport 389 accept           # LDAP
+        udp dport 389 accept           # LDAP / CLDAP
+        tcp dport 445 accept           # SMB
+        tcp dport 464 accept           # Kerberos kpasswd
+        udp dport 464 accept           # Kerberos kpasswd
+        tcp dport 636 accept           # LDAPS
+        tcp dport 3268 accept          # Catalogue global
+        tcp dport 3269 accept          # Catalogue global SSL
+        tcp dport 49152-65535 accept   # Plage RPC dynamique
+
+        # NetBIOS (137/udp, 138/udp, 139/tcp) VOLONTAIREMENT ABSENT.
+        # Le smb.conf de reference impose "disable netbios = yes" et
+        # "smb ports = 445" : ces trois ports ne doivent pas etre ouverts.
+
+        # ADWS (module Synetis), uniquement si le module est deploye.
+        # tcp dport 9389 accept
+    }
+
+    chain forward {
+        type filter hook forward priority 0; policy drop;
+    }
+
+    chain output {
+        type filter hook output priority 0; policy accept;
+        # NOTE : le referentiel SECOP applique "policy drop" en sortie et
+        # n'autorise que DNS, HTTP/HTTPS, NTP et ICMP. Sur un DC, cela bloque
+        # la replication sortante, les liaisons LDAP vers les autres DC et les
+        # reponses RPC dynamiques. Si une politique de sortie stricte est
+        # exigee, dupliquer la liste de ports ci-dessus en "dport" sortant.
+    }
+}
+
+# ATTENTION - Les GPO Samba peuvent piloter le pare-feu des machines Linux
+# membres et controleurs de domaine (samba-gpupdate). Verifier qu'aucune GPO
+# ne vient ecraser ce jeu de regles, sous peine de conflit silencieux avec le
+# paquet de durcissement.

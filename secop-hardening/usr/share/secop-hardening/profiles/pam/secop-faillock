@@ -1,0 +1,13 @@
+Name: SECOP - blocage apres echecs repetes (faillock)
+Default: yes
+Priority: 1100
+Auth-Type: Primary
+Auth:
+	[success=ok default=1]		pam_faillock.so preauth
+Auth-Initial:
+	[success=ok default=1]		pam_faillock.so preauth
+Account-Type: Primary
+Account:
+	required			pam_faillock.so
+Account-Initial:
+	required			pam_faillock.so

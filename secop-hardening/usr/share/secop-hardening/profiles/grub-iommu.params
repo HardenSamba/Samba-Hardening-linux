@@ -1,0 +1,6 @@
+# --- ANSSI BP-028 R7 : activation de l'IOMMU ------------------------------
+#
+# Isole les acces memoire directs des peripheriques. Sur certaines machines
+# physiques ou hyperviseurs, ce parametre empeche le demarrage ou fait
+# disparaitre des peripheriques. A tester avec un acces console ouvert.
+iommu=force

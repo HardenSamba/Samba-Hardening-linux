@@ -1,0 +1,7 @@
+
+        # --- Active Directory ---
+        tcp dport { 53, 88, 135, 389, 445, 464, 636, 3268, 3269 } accept
+        udp dport { 53, 88, 123, 389, 464 } accept
+        tcp dport 49152-65535 accept
+        # NetBIOS (137, 138, 139) volontairement absent : le smb.conf de
+        # reference impose "disable netbios = yes" et "smb ports = 445".

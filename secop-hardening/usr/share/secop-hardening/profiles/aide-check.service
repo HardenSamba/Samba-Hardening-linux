@@ -1,0 +1,9 @@
+[Unit]
+Description=Verification d'integrite AIDE (SECOP)
+Documentation=man:aide(1)
+
+[Service]
+Type=oneshot
+ExecStart=/usr/bin/aide --check --config /etc/aide/aide.conf
+Nice=19
+IOSchedulingClass=idle

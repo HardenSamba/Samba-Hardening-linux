@@ -1,0 +1,16 @@
+[Unit]
+Description=Verrouillage du chargement de modules noyau (SECOP, ANSSI R10)
+DefaultDependencies=no
+After=multi-user.target systemd-modules-load.service
+Before=shutdown.target
+Conflicts=shutdown.target
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+# Operation irreversible jusqu'au prochain demarrage : plus aucun module ne
+# pourra etre charge, y compris par un peripherique branche a chaud.
+ExecStart=/sbin/sysctl -q -w kernel.modules_disabled=1
+
+[Install]
+WantedBy=multi-user.target

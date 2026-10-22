@@ -1,0 +1,9 @@
+# --- ANSSI BP-028 R8 : desactivation du multithreading simultane -----------
+#
+# ATTENTION - Ce parametre divise par deux le nombre de processeurs logiques
+# visibles par le systeme. Sur une machine dimensionnee au plus juste, l'effet
+# sur les performances est immediat.
+#
+# Il est cependant INDISPENSABLE pour que le point R8 passe au vert : le
+# script de diagnostic exige la liste complete des parametres.
+mds=full,nosmt

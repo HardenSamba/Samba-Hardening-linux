@@ -1,0 +1,26 @@
+#!/bin/sh
+set -e
+
+case "$1" in
+    configure)
+        echo ""
+        echo "Application du durcissement SECOP..."
+        /usr/sbin/secop-harden apply || {
+            echo "AVERTISSEMENT : l'application automatique a echoue." >&2
+            echo "Relancer manuellement : secop-harden apply" >&2
+        }
+        echo ""
+        echo "-------------------------------------------------------------"
+        echo " Configuration : /etc/secop/hardening.conf"
+        echo " Etat courant  : secop-harden status"
+        echo " Retrait       : secop-harden revert"
+        echo ""
+        echo " Un redemarrage est necessaire pour que le blocage des"
+        echo " modules noyau soit pleinement effectif."
+        echo "-------------------------------------------------------------"
+        ;;
+    abort-upgrade|abort-remove|abort-deconfigure)
+        ;;
+esac
+
+exit 0

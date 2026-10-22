@@ -1,0 +1,18 @@
+#!/usr/sbin/nft -f
+# Jeu de regles genere par secop-harden - NE PAS EDITER A LA MAIN.
+# Modifier /etc/secop/hardening.conf puis relancer : secop-harden apply
+
+flush ruleset
+
+table inet secop {
+    chain input {
+        type filter hook input priority 0; policy drop;
+
+        # Boucle locale et connexions deja etablies : toujours en premier.
+        iif "lo" accept
+        ct state established,related accept
+        ct state invalid drop
+
+        # ICMP : indispensable au bon fonctionnement du reseau.
+        ip protocol icmp icmp type { echo-request, echo-reply, destination-unreachable, time-exceeded, parameter-problem } accept
+        ip6 nexthdr ipv6-icmp accept

@@ -1,0 +1,17 @@
+[Unit]
+Description=Pare-feu SECOP (ANSSI BP-028 R79)
+Documentation=man:nft(8)
+After=network-pre.target
+Before=network.target
+Wants=network-pre.target
+Conflicts=nftables.service
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/sbin/nft -f /etc/nftables.d/99-secop-anssi.nft
+ExecReload=/usr/sbin/nft -f /etc/nftables.d/99-secop-anssi.nft
+ExecStop=/usr/sbin/nft flush ruleset
+
+[Install]
+WantedBy=multi-user.target

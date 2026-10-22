@@ -1,0 +1,12 @@
+# Binaires autorises a conserver leurs droits speciaux - ANSSI BP-028 R57
+# Liste exactement alignee sur celle du script de diagnostic.
+# Un chemin par ligne, comparaison exacte.
+
+/usr/bin/passwd
+/usr/bin/mount
+/usr/bin/gpasswd
+/usr/bin/umount
+/usr/bin/sudo
+/usr/bin/su
+/usr/lib/dbus-1.0/dbus-daemon-launch-helper
+/usr/lib/openssh/ssh-keysign
